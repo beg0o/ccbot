@@ -29,6 +29,7 @@ Key functions: create_bot(), handle_new_message().
 """
 
 import asyncio
+import os
 import io
 import logging
 from pathlib import Path
@@ -283,6 +284,186 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             trimmed = trimmed[:3000] + "\n... (truncated)"
         await safe_reply(update.message, f"```\n{trimmed}\n```")
 
+
+
+
+async def terminals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all running terminals (Windows Terminal tabs + tmux windows)."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    lines: list[str] = []
+
+    # Part 1: Windows Terminal tabs via PowerShell script
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\" + os.getlogin()), ".claude", "check_tabs.ps1"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        wt_output = stdout.decode("utf-8", errors="replace").strip()
+        if wt_output:
+            lines.append("Windows Terminal:")
+            for line in wt_output.splitlines():
+                if line.strip():
+                    lines.append(line)
+        else:
+            lines.append("Windows Terminal: not running")
+    except Exception:
+        lines.append("Windows Terminal: check failed")
+
+    lines.append("")
+
+    # Part 2: tmux sessions and windows
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-a", "-F",
+            "#{session_name}|#{window_name}|#{pane_current_path}|#{pane_current_command}|#{pane_title}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        tmux_output = stdout.decode("utf-8", errors="replace").strip()
+        if tmux_output:
+            lines.append("tmux:")
+            for line in tmux_output.splitlines():
+                parts = line.strip().split("|", 4)
+                if len(parts) < 5:
+                    continue
+                sess, wname, cwd, cmd, title = parts
+                # Shorten path
+                _home = os.path.expanduser("~")
+                _user = os.getlogin()
+                _win_home = f"/mnt/c/Users/{_user}/"
+                if cwd == _home:
+                    short_path = "~"
+                elif cwd.startswith(_home + "/"):
+                    short_path = "~/" + cwd[len(_home) + 1:]
+                elif cwd.startswith(_win_home):
+                    short_path = cwd[len(_win_home):]
+                else:
+                    short_path = cwd
+                # Label command
+                if cmd == "claude":
+                    cmd_label = "Claude Code"
+                elif cmd == "python3" and wname in ("bash", "python3"):
+                    cmd_label = "ccbot"
+                else:
+                    cmd_label = cmd
+                # Extract meaningful title (skip hostname-only titles)
+                task = ""
+                title = title.strip()
+                hostname_markers = ("DESKTOP-", "localhost", "ubuntu")
+                if title and not any(title.upper().startswith(m.upper()) for m in hostname_markers):
+                    # Clean up status markers
+                    clean = title.lstrip("\u2733\u2731\u25cf\u25cb\u2699 ")
+                    if clean and clean != wname:
+                        task = clean
+                # Build line
+                info = f"  {wname} - {cmd_label}"
+                if short_path and short_path != "~":
+                    info += f" | {short_path}"
+                if task:
+                    info += f" | \"{task}\""
+                lines.append(info)
+        else:
+            lines.append("tmux: no sessions")
+    except Exception:
+        lines.append("tmux: check failed")
+
+    # Part 3: Active Claude Code sessions (from JSONL logs)
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        import time as _time
+
+        _now = _time.time()
+        _cutoff = _now - 600  # 10 minutes
+
+        _home = os.path.expanduser("~")
+        _user = os.getlogin()
+        _proj_roots = [
+            (f"/mnt/c/Users/{_user}/.claude/projects", "Win"),
+            (os.path.join(_home, ".claude", "projects"), "WSL"),
+        ]
+
+        _sessions: list[str] = []
+        for _root_str, _label in _proj_roots:
+            _root = _Path(_root_str)
+            if not _root.exists():
+                continue
+            for _pd in sorted(_root.iterdir()):
+                if not _pd.is_dir():
+                    continue
+                _jfiles = [f for f in _pd.glob("*.jsonl") if f.stat().st_mtime > _cutoff]
+                if not _jfiles:
+                    continue
+
+                # Decode project name from dir
+                _dn = _pd.name
+                _raw = _dn.replace(f"C--Users-{_user}-", "").replace(f"-home-{_user}-", "").replace(f"-mnt-c-Users-{_user}-", "")
+                _parts = [p for p in _raw.split("-") if p]
+                _proj = _parts[-1] if _parts else _dn
+
+                for _jf in sorted(_jfiles, key=lambda f: f.stat().st_mtime, reverse=True):
+                    _age = int((_now - _jf.stat().st_mtime) / 60)
+                    _task = None
+                    _human = None
+
+                    with open(_jf, "rb") as _fh:
+                        _fh.seek(0, 2)
+                        _sz = _fh.tell()
+                        _fh.seek(max(0, _sz - 200000))
+                        _data = _fh.read().decode("utf-8", errors="replace")
+
+                    for _line in reversed(_data.strip().split("\n")[-100:]):
+                        try:
+                            _e = _json.loads(_line)
+                        except _json.JSONDecodeError:
+                            continue
+                        _et = _e.get("type", "")
+                        if _et == "progress" and not _task:
+                            _pd2 = _e.get("data", {})
+                            if isinstance(_pd2, dict) and _pd2.get("taskDescription"):
+                                _task = _pd2["taskDescription"]
+                        if _et in ("human", "user") and not _human:
+                            _msg = _e.get("message", {})
+                            _c = _msg.get("content", "") if isinstance(_msg, dict) else ""
+                            if isinstance(_c, str) and _c.strip():
+                                _human = _c.strip()
+                            elif isinstance(_c, list):
+                                for _it in _c:
+                                    if isinstance(_it, dict) and _it.get("type") == "text":
+                                        _t = _it["text"].strip()
+                                        if _t:
+                                            _human = _t
+                                            break
+                        if _task and _human:
+                            break
+
+                    _summary = _task or _human or "(idle)"
+                    _summary = _summary.replace("\n", " ").strip()
+                    if len(_summary) > 80:
+                        _summary = _summary[:80] + "..."
+                    _sessions.append(f"  [{_label}] {_proj} ({_age}m ago) - {_summary}")
+
+        if _sessions:
+            lines.append("")
+            lines.append("Active sessions:")
+            lines.extend(_sessions)
+    except Exception:
+        lines.append("")
+        lines.append("Sessions: scan failed")
+
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        text = text[:3500] + "\n... (truncated)"
+    await safe_reply(update.message, f"```\n{text}\n```")
 
 
 # --- Screenshot keyboard with quick control keys ---
@@ -985,6 +1166,7 @@ async def post_init(application: Application) -> None:
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("terminals", "List all running terminals and tabs"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1042,6 +1224,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("terminals", terminals_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(MessageHandler(
